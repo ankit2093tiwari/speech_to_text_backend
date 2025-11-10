@@ -9,8 +9,6 @@ const { createClient } = require("@deepgram/sdk");
 const { translate } = require("@vitalets/google-translate-api");
 const cors = require("cors");
 const { extractMainTopic } = require("./topicExtractor");
-const OpenAI = require("openai");
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const app = express();
 const server = http.createServer(app);
@@ -140,56 +138,6 @@ async function translateText(text, targetLanguage) {
   } catch (error) {
     console.error("Translation error:", error);
     return text; // Return original text if translation fails
-  }
-}
-
-async function extractExactTopic(text) {
-  try {
-    if (!text || text.trim().length === 0) {
-      return "";
-    }
-
-    console.log(`Extracting topic from text: "${text.substring(0, 100)}..."`);
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a topic extraction expert. Extract the SINGLE most specific and central topic from the given text.
-
-                    RULES:
-                    1. Return ONLY the main topic as a concise phrase (1-4 words maximum)
-                    2. Read the ENTIRE text to understand what the speaker is primarily talking about
-                    4. If multiple subjects are mentioned, identify the PRIMARY subject that the speaker focuses on most
-                    6. Be specific and precise
-                    7. No explanations, no additional text - just the topic
-                    8. Never return "unknown" or "cannot determine" - always extract something meaningful"`
-        },
-        {
-          role: "user",
-          content: `Extract the exact topic never return "unknown" or "cannot determine" always extract something meaningful from this text: "${text}"`
-        }
-      ],
-      max_tokens: 20,
-      temperature: 0.1
-    });
-
-    const topic = response.choices[0].message.content.trim();
-
-    console.log(`Extracted topic: "${topic}"`);
-
-    return topic;
-
-  } catch (error) {
-    console.error('OpenAI topic extraction error:', error);
-
-    // Fallback: Return first few meaningful words
-    const words = text.split(/\s+/).filter(word => word.length > 3);
-    const fallbackTopic = words.slice(0, 3).join(' ') || text.substring(0, 20);
-
-    console.log(`🔄 Using fallback topic: "${fallbackTopic}"`);
-    return fallbackTopic;
   }
 }
 
@@ -323,14 +271,16 @@ async function processDiarization(
 
     channels.forEach((channel, channelIndex) => {
       console.log(
-        `Channel ${channelIndex}: ${channel.alternatives?.length || 0
+        `Channel ${channelIndex}: ${
+          channel.alternatives?.length || 0
         } alternatives`
       );
 
       channel.alternatives.forEach((alt, altIndex) => {
         const transcriptPreview = alt.transcript?.substring(0, 100) || "empty";
         console.log(
-          `Alternative ${altIndex}: "${transcriptPreview}${alt.transcript?.length > 100 ? "..." : ""
+          `Alternative ${altIndex}: "${transcriptPreview}${
+            alt.transcript?.length > 100 ? "..." : ""
           }"`
         );
 
@@ -456,42 +406,46 @@ async function processDiarization(
       let extractedTopic = null;
       let extractedSummary = filteredText;
 
-      if (typeof language === 'string' && language.toLowerCase().startsWith('en')) {
-        // Use Deepgram for summary, but ALWAYS use OpenAI for topic
-        console.log('Processing in English directly');
+      if (
+        typeof language === "string" &&
+        language.toLowerCase().startsWith("en")
+      ) {
+        // For English: Use enhanced topic extraction directly
+        console.log("Processing in English with enhanced extraction");
+        extractedTopic = await extractMainTopic(filteredText);
+        
+        // Also get Deepgram summary as backup
         const dgResult = await summarizeTextWithDeepgram(filteredText, language);
-        summary = dgResult.summary;
-
-        // ALWAYS extract topic using OpenAI
-        console.log('Extracting topic with OpenAI for better accuracy...');
-        topic = await extractExactTopic(filteredText);
-
+        extractedSummary = dgResult.summary || filteredText;
+        
+        // If enhanced extraction fails, use Deepgram topic
+        if (!extractedTopic || extractedTopic === "unknown topic") {
+          extractedTopic = dgResult.topic || extractedSummary.split(/\s+/).slice(0, 3).join(" ");
+        }
       } else {
-        // For non-English: Translate → Deepgram → Translate back
-        console.log(`Processing non-English (${language})`);
+        // For non-English: Translate → Enhanced extraction → Translate back
+        console.log(`Processing non-English (${language}) with enhanced extraction`);
         try {
-          console.log('Translating to English...');
-          const translatedTranscript = await translateText(filteredText, 'en');
+          console.log("Translating to English...");
+          const translatedTranscript = await translateText(filteredText, "en");
           console.log(`Translated: "${translatedTranscript.substring(0, 100)}..."`);
 
-          console.log('Getting summary/topic in English...');
-          const dgResult = await summarizeTextWithDeepgram(translatedTranscript, 'en');
+          console.log("Extracting topic with enhanced method...");
+          const englishTopic = await extractMainTopic(translatedTranscript);
+          
+          // Get Deepgram summary
+          const dgResult = await summarizeTextWithDeepgram(translatedTranscript, "en");
 
-          console.log('Translating summary back to original language...');
-          summary = await translateText(dgResult.summary, language);
+          console.log("Translating results back to original language...");
+          extractedSummary = await translateText(dgResult.summary || filteredText, language);
+          extractedTopic = await translateText(englishTopic || dgResult.topic || "unknown", language);
 
-          // Extract topic using OpenAI from the FULL translated text
-          console.log('Extracting topic with OpenAI for better accuracy...');
-          const englishTopic = await extractExactTopic(translatedTranscript);
-          topic = await translateText(englishTopic, language);
-
-          console.log(`Final summary: "${summary}"`);
-          console.log(`Final topic: "${topic}"`);
-
+          console.log(`Final summary: "${extractedSummary}"`);
+          console.log(`Final topic: "${extractedTopic}"`);
         } catch (translationError) {
-          console.error('Translation process failed, using fallback:', translationError);
-          summary = filteredText;
-          topic = filteredText.split(' ').slice(0, 4).join(' ');
+          console.error("Translation process failed, using fallback:", translationError);
+          extractedSummary = filteredText;
+          extractedTopic = await extractMainTopic(filteredText) || filteredText.split(" ").slice(0, 3).join(" ");
         }
       }
 
@@ -781,7 +735,7 @@ app.post(
       console.error("Error:", err);
       try {
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      } catch (e) { }
+      } catch (e) {}
       res
         .status(500)
         .json({ error: "Processing failed", message: err.message });
@@ -918,7 +872,8 @@ wss.on("connection", (ws) => {
             : "magic_not_started";
 
           console.log(
-            `Manual stop but ${wasRecording ? "no chunks captured" : "magic never started"
+            `Manual stop but ${
+              wasRecording ? "no chunks captured" : "magic never started"
             }`
           );
 
